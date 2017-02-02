@@ -38,7 +38,10 @@ import (
 	"k8s.io/client-go/1.5/pkg/api/v1"
 )
 
-var reconcileInterval = 8 * time.Second
+var (
+	reconcileInterval         = 8 * time.Second
+	podTerminationGracePeriod = int64(5)
+)
 
 type clusterEventType string
 
@@ -94,7 +97,7 @@ func New(config Config, e *spec.EtcdCluster, stopC <-chan struct{}, wg *sync.Wai
 		cluster: e,
 		eventCh: make(chan *clusterEvent, 100),
 		stopCh:  make(chan struct{}),
-		status:  e.Status,
+		status:  &e.Status,
 		gc:      garbagecollection.New(config.KubeCli, e.Namespace),
 	}
 
@@ -188,6 +191,8 @@ func (c *Cluster) create() error {
 }
 
 func (c *Cluster) prepareSeedMember() error {
+	c.status.AppendScalingUpCondition(0, c.cluster.Spec.Size)
+
 	var err error
 	if sh := c.cluster.Spec.SelfHosted; sh != nil {
 		if len(sh.BootMemberClientEndpoint) == 0 {
@@ -198,7 +203,12 @@ func (c *Cluster) prepareSeedMember() error {
 	} else {
 		err = c.newSeedMember()
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	c.status.Size = 1
+	return nil
 }
 
 func (c *Cluster) Delete() {
@@ -208,9 +218,11 @@ func (c *Cluster) Delete() {
 func (c *Cluster) send(ev *clusterEvent) {
 	select {
 	case c.eventCh <- ev:
+		l, ecap := len(c.eventCh), cap(c.eventCh)
+		if l > int(float64(ecap)*0.8) {
+			c.logger.Warningf("eventCh buffer is almost full [%d/%d]", l, ecap)
+		}
 	case <-c.stopCh:
-	default:
-		panic("TODO: too many events queued...")
 	}
 }
 
@@ -311,7 +323,7 @@ func (c *Cluster) run(stopC <-chan struct{}) {
 	}
 }
 
-func isSpecEqual(s1, s2 *spec.ClusterSpec) bool {
+func isSpecEqual(s1, s2 spec.ClusterSpec) bool {
 	if s1.Size != s2.Size || s1.Paused != s2.Paused || s1.Version != s2.Version {
 		return false
 	}
@@ -433,7 +445,11 @@ func (c *Cluster) removePodAndService(name string) error {
 			return err
 		}
 	}
-	err = c.config.KubeCli.Core().Pods(c.cluster.Namespace).Delete(name, api.NewDeleteOptions(0))
+
+	err = c.config.KubeCli.Core().Pods(c.cluster.Namespace).Delete(
+		name,
+		api.NewDeleteOptions(podTerminationGracePeriod),
+	)
 	if err != nil {
 		if !k8sutil.IsKubernetesResourceNotFoundError(err) {
 			return err
@@ -472,12 +488,12 @@ func (c *Cluster) pollPods() ([]*v1.Pod, []*v1.Pod, error) {
 }
 
 func (c *Cluster) updateStatus() error {
-	if reflect.DeepEqual(c.cluster.Status, c.status) {
+	if reflect.DeepEqual(c.cluster.Status, *c.status) {
 		return nil
 	}
 
 	newCluster := c.cluster
-	newCluster.Status = c.status
+	newCluster.Status = *c.status
 	newCluster, err := k8sutil.UpdateClusterTPRObject(c.config.KubeCli.Core().GetRESTClient(), c.cluster.GetNamespace(), newCluster)
 	if err != nil {
 		return err
@@ -494,10 +510,14 @@ func (c *Cluster) reportFailedStatus() {
 		if err == nil || k8sutil.IsKubernetesResourceNotFoundError(err) {
 			return true, nil
 		}
-
 		if apierrors.IsConflict(err) {
 			cl, err := k8sutil.GetClusterTPRObject(c.config.KubeCli.Core().GetRESTClient(), c.cluster.Namespace, c.cluster.Name)
 			if err != nil {
+				// Update (PUT) with UID set will return conflict even if object is deleted.
+				// Because it will check UID first and return something like: "Precondition failed: UID in precondition: 0xc42712c0f0, UID in object meta: ".
+				if k8sutil.IsKubernetesResourceNotFoundError(err) {
+					return true, nil
+				}
 				c.logger.Warningf("report status: fail to get latest version: %v", err)
 				return false, nil
 			}
