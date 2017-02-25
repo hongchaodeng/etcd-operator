@@ -15,40 +15,51 @@
 package spec
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"k8s.io/client-go/1.5/pkg/api/meta/metatypes"
-	"k8s.io/client-go/1.5/pkg/api/unversioned"
-	"k8s.io/client-go/1.5/pkg/api/v1"
+	"k8s.io/client-go/pkg/api/meta/metatypes"
+	"k8s.io/client-go/pkg/api/unversioned"
+	"k8s.io/client-go/pkg/api/v1"
 )
 
 const (
 	defaultVersion = "3.1.0"
+
+	TPRKind        = "cluster"
+	TPRKindPlural  = "clusters"
+	TPRGroup       = "etcd.coreos.com"
+	TPRVersion     = "v1beta1"
+	TPRDescription = "Managed etcd clusters"
 )
 
 var (
 	ErrBackupUnsetRestoreSet = errors.New("spec: backup policy must be set if restore policy is set")
 )
 
-type EtcdCluster struct {
+func TPRName() string {
+	return fmt.Sprintf("%s.%s", TPRKind, TPRGroup)
+}
+
+type Cluster struct {
 	unversioned.TypeMeta `json:",inline"`
-	v1.ObjectMeta        `json:"metadata,omitempty"`
+	Metadata             v1.ObjectMeta `json:"metadata,omitempty"`
 	Spec                 ClusterSpec   `json:"spec"`
 	Status               ClusterStatus `json:"status"`
 }
 
-func (e *EtcdCluster) AsOwner() metatypes.OwnerReference {
+func (c *Cluster) AsOwner() metatypes.OwnerReference {
 	trueVar := true
 	// TODO: In 1.6 this is gonna be "k8s.io/kubernetes/pkg/apis/meta/v1"
 	// Both api.OwnerReference and metatypes.OwnerReference are combined into that.
 	return metatypes.OwnerReference{
-		APIVersion: e.APIVersion,
-		Kind:       e.Kind,
-		Name:       e.Name,
-		UID:        e.UID,
+		APIVersion: c.APIVersion,
+		Kind:       c.Kind,
+		Name:       c.Metadata.Name,
+		UID:        c.Metadata.UID,
 		Controller: &trueVar,
 	}
 }
@@ -108,6 +119,10 @@ type PodPolicy struct {
 	// AntiAffinity determines if the etcd-operator tries to avoid putting
 	// the etcd members in the same cluster onto the same node.
 	AntiAffinity bool `json:"antiAffinity"`
+
+	// ResourceRequirements is the resource requirements for the etcd container.
+	// This field cannot be updated once the cluster is created.
+	ResourceRequirements v1.ResourceRequirements `json:"resourceRequirements"`
 }
 
 func (c *ClusterSpec) Validate() error {
@@ -181,6 +196,24 @@ type ClusterStatus struct {
 	// TargetVersion is the version the cluster upgrading to.
 	// If the cluster is not upgrading, TargetVersion is empty.
 	TargetVersion string `json:"targetVersion"`
+
+	// BackupServiceStatus is the status of the backup service.
+	// BackupServiceStatus only exists when backup is enabled in the
+	// cluster spec.
+	BackupServiceStatus *BackupServiceStatus `json:"backupServiceStatus,omitempty"`
+}
+
+func (cs ClusterStatus) Copy() ClusterStatus {
+	newCS := ClusterStatus{}
+	b, err := json.Marshal(cs)
+	if err != nil {
+		panic(err)
+	}
+	err = json.Unmarshal(b, &newCS)
+	if err != nil {
+		panic(err)
+	}
+	return newCS
 }
 
 func (cs *ClusterStatus) IsFailed() bool {

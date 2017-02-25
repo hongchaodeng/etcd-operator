@@ -15,29 +15,42 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"time"
 
+	"github.com/coreos/etcd-operator/client/experimentalclient"
+	"github.com/coreos/etcd-operator/pkg/backup/backupapi"
 	"github.com/coreos/etcd-operator/pkg/cluster/backupstorage"
 	"github.com/coreos/etcd-operator/pkg/spec"
 	"github.com/coreos/etcd-operator/pkg/util/k8sutil"
 
 	"github.com/Sirupsen/logrus"
-	"k8s.io/client-go/1.5/pkg/api/v1"
+	"k8s.io/client-go/pkg/api/v1"
+)
+
+const (
+	defaultBackupHTTPTimeout     = 5 * time.Second
+	defaultBackupCreatingTimeout = 1 * time.Minute
 )
 
 type backupManager struct {
 	logger *logrus.Entry
 
 	config  Config
-	cluster *spec.EtcdCluster
+	cluster *spec.Cluster
 	s       backupstorage.Storage
+
+	bc experimentalclient.Backup
 }
 
-func newBackupManager(c Config, cl *spec.EtcdCluster, l *logrus.Entry) (*backupManager, error) {
+func newBackupManager(c Config, cl *spec.Cluster, l *logrus.Entry) (*backupManager, error) {
 	bm := &backupManager{
 		config:  c,
 		cluster: cl,
 		logger:  l,
+		bc:      experimentalclient.NewBackup(&http.Client{}, "http", cl.Metadata.GetName()),
 	}
 	var err error
 	bm.s, err = bm.setupStorage()
@@ -56,16 +69,16 @@ func (bm *backupManager) setupStorage() (s backupstorage.Storage, err error) {
 	b := cl.Spec.Backup
 	switch b.StorageType {
 	case spec.BackupStorageTypePersistentVolume, spec.BackupStorageTypeDefault:
-		s, err = backupstorage.NewPVStorage(c.KubeCli, cl.Name, cl.Namespace, c.PVProvisioner, *b)
+		s, err = backupstorage.NewPVStorage(c.KubeCli, cl.Metadata.Name, cl.Metadata.Namespace, c.PVProvisioner, *b)
 	case spec.BackupStorageTypeS3:
-		s, err = backupstorage.NewS3Storage(c.S3Context, c.KubeCli, cl.Name, cl.Namespace, *b)
+		s, err = backupstorage.NewS3Storage(c.S3Context, c.KubeCli, cl.Metadata.Name, cl.Metadata.Namespace, *b)
 	}
 	return s, err
 }
 
 func (bm *backupManager) setup() error {
 	r := bm.cluster.Spec.Restore
-	restoreSameNameCluster := r != nil && r.BackupClusterName == bm.cluster.Name
+	restoreSameNameCluster := r != nil && r.BackupClusterName == bm.cluster.Metadata.Name
 
 	// There is only one case that we don't need to create underlying storage.
 	// That is, the storage already exists and we are restoring cluster from it.
@@ -77,7 +90,7 @@ func (bm *backupManager) setup() error {
 
 	if r != nil {
 		bm.logger.Infof("restoring cluster from existing backup (%s)", r.BackupClusterName)
-		if bm.cluster.Name != r.BackupClusterName {
+		if bm.cluster.Metadata.Name != r.BackupClusterName {
 			if err := bm.s.Clone(r.BackupClusterName); err != nil {
 				return err
 			}
@@ -89,13 +102,13 @@ func (bm *backupManager) setup() error {
 
 func (bm *backupManager) runSidecar() error {
 	cl, c := bm.cluster, bm.config
-	podSpec, err := k8sutil.MakeBackupPodSpec(cl.Name, cl.Spec.Backup)
+	podSpec, err := k8sutil.NewBackupPodSpec(cl.Metadata.Name, bm.config.ServiceAccount, cl.Spec.Backup)
 	if err != nil {
 		return err
 	}
 	switch cl.Spec.Backup.StorageType {
 	case spec.BackupStorageTypeDefault, spec.BackupStorageTypePersistentVolume:
-		podSpec = k8sutil.PodSpecWithPV(podSpec, cl.Name)
+		podSpec = k8sutil.PodSpecWithPV(podSpec, cl.Metadata.Name)
 	case spec.BackupStorageTypeS3:
 		podSpec = k8sutil.PodSpecWithS3(podSpec, c.S3Context)
 	}
@@ -110,8 +123,8 @@ func (bm *backupManager) runSidecar() error {
 }
 
 func (bm *backupManager) createBackupReplicaSet(podSpec v1.PodSpec) error {
-	rs := k8sutil.NewBackupReplicaSetManifest(bm.cluster.Name, podSpec, bm.cluster.AsOwner())
-	_, err := bm.config.KubeCli.Extensions().ReplicaSets(bm.cluster.Namespace).Create(rs)
+	rs := k8sutil.NewBackupReplicaSetManifest(bm.cluster.Metadata.Name, podSpec, bm.cluster.AsOwner())
+	_, err := bm.config.KubeCli.ExtensionsV1beta1().ReplicaSets(bm.cluster.Metadata.Namespace).Create(rs)
 	if err != nil {
 		if !k8sutil.IsKubernetesResourceAlreadyExistError(err) {
 			return err
@@ -121,8 +134,8 @@ func (bm *backupManager) createBackupReplicaSet(podSpec v1.PodSpec) error {
 }
 
 func (bm *backupManager) createBackupService() error {
-	svc := k8sutil.NewBackupServiceManifest(bm.cluster.Name, bm.cluster.AsOwner())
-	_, err := bm.config.KubeCli.Core().Services(bm.cluster.Namespace).Create(svc)
+	svc := k8sutil.NewBackupServiceManifest(bm.cluster.Metadata.Name, bm.cluster.AsOwner())
+	_, err := bm.config.KubeCli.CoreV1().Services(bm.cluster.Metadata.Namespace).Create(svc)
 	if err != nil {
 		if !k8sutil.IsKubernetesResourceAlreadyExistError(err) {
 			return err
@@ -138,4 +151,37 @@ func (bm *backupManager) cleanup() error {
 		return fmt.Errorf("fail to delete backup storage: %v", err)
 	}
 	return nil
+}
+
+func (bm *backupManager) requestBackup() error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultBackupHTTPTimeout+defaultBackupCreatingTimeout)
+	defer cancel()
+	return bm.bc.Request(ctx)
+}
+
+func (bm *backupManager) checkBackupExist(ver string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultBackupHTTPTimeout)
+	defer cancel()
+	return bm.bc.Exist(ctx, ver)
+}
+
+func (bm *backupManager) getStatus() (*backupapi.ServiceStatus, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultBackupHTTPTimeout)
+	defer cancel()
+	return bm.bc.ServiceStatus(ctx)
+}
+
+func backupServiceStatusToTPRBackupServiceStatu(s *backupapi.ServiceStatus) *spec.BackupServiceStatus {
+	bs := &spec.BackupServiceStatus{
+		Backups: s.Backups,
+	}
+	if rb := s.RecentBackup; rb != nil {
+		bs.RecentBackup = &spec.BackupStatus{
+			CreationTime:     rb.CreationTime,
+			Size:             rb.Size,
+			Version:          rb.Version,
+			TimeTookInSecond: rb.TimeTookInSecond,
+		}
+	}
+	return bs
 }

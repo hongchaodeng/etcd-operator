@@ -16,15 +16,8 @@ package cluster
 
 import (
 	"errors"
-	"fmt"
-	"io/ioutil"
-	"net/http"
-	"path"
-	"time"
 
-	"github.com/coreos/etcd-operator/pkg/backup"
 	"github.com/coreos/etcd-operator/pkg/spec"
-	"github.com/coreos/etcd-operator/pkg/util"
 	"github.com/coreos/etcd-operator/pkg/util/constants"
 	"github.com/coreos/etcd-operator/pkg/util/etcdutil"
 	"github.com/coreos/etcd-operator/pkg/util/k8sutil"
@@ -32,7 +25,7 @@ import (
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
 	"golang.org/x/net/context"
-	"k8s.io/client-go/1.5/pkg/api/v1"
+	"k8s.io/client-go/pkg/api/v1"
 )
 
 // reconcile reconciles cluster current state to desired state specified by spec.
@@ -132,7 +125,7 @@ func (c *Cluster) addOneMember() error {
 	}
 	defer etcdcli.Close()
 
-	newMemberName := etcdutil.CreateMemberName(c.cluster.Name, c.memberCounter)
+	newMemberName := etcdutil.CreateMemberName(c.cluster.Metadata.Name, c.memberCounter)
 	newMember := &etcdutil.Member{Name: newMemberName}
 	ctx, _ := context.WithTimeout(context.Background(), constants.DefaultRequestTimeout)
 	resp, err := etcdcli.MemberAdd(ctx, []string{newMember.PeerAddr()})
@@ -199,7 +192,7 @@ func (c *Cluster) disasterRecovery(left etcdutil.MemberSet) error {
 	backupNow := false
 	if len(left) > 0 {
 		c.logger.Infof("pods are still running (%v). Will try to make a latest backup from one of them.", left)
-		err := RequestBackupNow(k8sutil.MakeBackupHostPort(c.cluster.Name))
+		err := c.bm.requestBackup()
 		if err != nil {
 			c.logger.Errorln(err)
 		} else {
@@ -211,7 +204,7 @@ func (c *Cluster) disasterRecovery(left etcdutil.MemberSet) error {
 	} else {
 		// We don't return error if backupnow failed. Instead, we ask if there is previous backup.
 		// If so, we can still continue. Otherwise, it's fatal error.
-		exist, err := checkBackupExist(k8sutil.MakeBackupHostPort(c.cluster.Name), c.cluster.Spec.Version)
+		exist, err := c.bm.checkBackupExist(c.cluster.Spec.Version)
 		if err != nil {
 			c.logger.Errorln(err)
 			return err
@@ -227,54 +220,7 @@ func (c *Cluster) disasterRecovery(left etcdutil.MemberSet) error {
 			return err
 		}
 	}
-	return c.restoreSeedMember()
-}
-
-// TODO: make this private
-func RequestBackupNow(addr string) error {
-	httpcli := http.Client{
-		Timeout: 30 * time.Second,
-	}
-	resp, err := httpcli.Get(fmt.Sprintf("http://%s/backupnow", path.Join(addr, backup.APIV1)))
-	if err != nil {
-		return fmt.Errorf("backupnow (%s) failed: %v", addr, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			b = []byte(fmt.Sprintf("fail to read HTTP response: %v", err))
-		}
-		return fmt.Errorf("backupnow (%s) failed: unexpected status code (%v), response (%s)",
-			addr, resp.Status, string(b))
-	}
-	return nil
-}
-
-func checkBackupExist(addr, ver string) (bool, error) {
-	httpcli := http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	req := &http.Request{
-		Method: http.MethodHead,
-		URL:    util.MakeBackupURL(addr, ver),
-	}
-
-	resp, err := httpcli.Do(req)
-	if err != nil {
-		return false, fmt.Errorf("check backup (%s) failed: %v", addr, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			b = []byte(fmt.Sprintf("fail to read HTTP response: %v", err))
-		}
-		return false, fmt.Errorf("check backup (%s) failed: unexpected status code (%v), response (%s)",
-			addr, resp.Status, string(b))
-	}
-	return true, nil
+	return c.recover()
 }
 
 func needUpgrade(pods []*v1.Pod, cs spec.ClusterSpec) bool {

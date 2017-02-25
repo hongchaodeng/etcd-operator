@@ -18,14 +18,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/coreos/etcd-operator/pkg/spec"
 
-	"k8s.io/client-go/1.5/pkg/api/unversioned"
+	"k8s.io/client-go/pkg/api/unversioned"
+	kwatch "k8s.io/client-go/pkg/watch"
 )
 
 type rawEvent struct {
-	Type   string
+	Type   kwatch.EventType
 	Object json.RawMessage
 }
 
@@ -39,7 +41,7 @@ func pollEvent(decoder *json.Decoder) (*Event, *unversioned.Status, error) {
 		return nil, nil, fmt.Errorf("fail to decode raw event from apiserver (%v)", err)
 	}
 
-	if re.Type == "ERROR" {
+	if re.Type == kwatch.Error {
 		status := &unversioned.Status{}
 		err = json.Unmarshal(re.Object, status)
 		if err != nil {
@@ -50,11 +52,39 @@ func pollEvent(decoder *json.Decoder) (*Event, *unversioned.Status, error) {
 
 	ev := &Event{
 		Type:   re.Type,
-		Object: &spec.EtcdCluster{},
+		Object: &spec.Cluster{},
 	}
 	err = json.Unmarshal(re.Object, ev.Object)
 	if err != nil {
-		return nil, nil, fmt.Errorf("fail to unmarshal EtcdCluster object from data (%s): %v", re.Object, err)
+		return nil, nil, fmt.Errorf("fail to unmarshal Cluster object from data (%s): %v", re.Object, err)
 	}
 	return ev, nil, nil
+}
+
+// panicTimer panics when it reaches the given duration.
+type panicTimer struct {
+	d   time.Duration
+	msg string
+	t   *time.Timer
+}
+
+func newPanicTimer(d time.Duration, msg string) *panicTimer {
+	return &panicTimer{
+		d:   d,
+		msg: msg,
+	}
+}
+
+func (pt *panicTimer) start() {
+	pt.t = time.AfterFunc(pt.d, func() {
+		panic(pt.msg)
+	})
+}
+
+// stop stops the timer and resets the elapsed duration.
+func (pt *panicTimer) stop() {
+	if pt.t != nil {
+		pt.t.Stop()
+		pt.t = nil
+	}
 }

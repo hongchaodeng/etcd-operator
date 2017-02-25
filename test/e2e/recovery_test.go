@@ -61,7 +61,7 @@ func testOneMemberRecovery(t *testing.T) {
 		}
 	}()
 
-	names, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 60*time.Second)
+	names, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 60*time.Second)
 	if err != nil {
 		t.Fatalf("failed to create 3 members etcd cluster: %v", err)
 	}
@@ -70,7 +70,7 @@ func testOneMemberRecovery(t *testing.T) {
 	if err := killMembers(f, names[0]); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 60*time.Second); err != nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 60*time.Second); err != nil {
 		t.Fatalf("failed to resize to 3 members etcd cluster: %v", err)
 	}
 }
@@ -112,33 +112,33 @@ func testDisasterRecoveryWithBackupPolicy(t *testing.T, numToKill int, backupPol
 		}
 	}()
 
-	names, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 60*time.Second)
+	names, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 60*time.Second)
 	if err != nil {
 		t.Fatalf("failed to create 3 members etcd cluster: %v", err)
 	}
 	fmt.Println("reached to 3 members cluster")
-	if err := waitBackupPodUp(f, testEtcd.Name, 60*time.Second); err != nil {
+	if err := waitBackupPodUp(f, testEtcd.Metadata.Name, 60*time.Second); err != nil {
 		t.Fatalf("failed to create backup pod: %v", err)
 	}
 	// No left pod to make a backup from. We need to back up ahead.
 	// If there is any left pod, ooperator should be able to make a backup from it.
-	if numToKill == len(names) {
-		if err := makeBackup(f, testEtcd.Name); err != nil {
+	if numToKill == testEtcd.Spec.Size {
+		if err := makeBackup(f, testEtcd.Metadata.Name); err != nil {
 			t.Fatalf("fail to make a latest backup: %v", err)
 		}
+	} else {
+		// Wait 2*5s to make sure the all pods are up and running.
+		// Otherwise, the last member could have not come up yet.
+		// Thus if we delete any member, it loses quorum and also exits.
+		time.Sleep(10 * time.Second)
 	}
-	// Reverse the order because the last member could have not come ready yet.
-	// Try to prioritize deleting it first.
-	toKill := make([]string, numToKill)
-	for i := 0; i < numToKill; i++ {
-		toKill[i] = names[len(names)-i-1]
-	}
-	// TODO: race: members are recovered between they are deleted one by one.
-	logfWithTimestamp(t, "killing pods: %v", names)
+	toKill := names[:numToKill]
+	logfWithTimestamp(t, "killing pods: %v", toKill)
+	// TODO: race: members could be recovered between being deleted one by one.
 	if err := killMembers(f, toKill...); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 120*time.Second); err != nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 120*time.Second); err != nil {
 		t.Fatalf("failed to resize to 3 members etcd cluster: %v", err)
 	}
 	// TODO: add checking of data in etcd

@@ -15,7 +15,6 @@
 package cluster
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -31,11 +30,10 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/pborman/uuid"
-	"k8s.io/client-go/1.5/kubernetes"
-	"k8s.io/client-go/1.5/pkg/api"
-	apierrors "k8s.io/client-go/1.5/pkg/api/errors"
-	"k8s.io/client-go/1.5/pkg/api/meta/metatypes"
-	"k8s.io/client-go/1.5/pkg/api/v1"
+	"k8s.io/client-go/kubernetes"
+	apierrors "k8s.io/client-go/pkg/api/errors"
+	"k8s.io/client-go/pkg/api/meta/metatypes"
+	"k8s.io/client-go/pkg/api/v1"
 )
 
 var (
@@ -52,15 +50,15 @@ const (
 
 type clusterEvent struct {
 	typ     clusterEventType
-	cluster *spec.EtcdCluster
+	cluster *spec.Cluster
 }
 
 type Config struct {
-	PVProvisioner string
+	PVProvisioner  string
+	ServiceAccount string
 	s3config.S3Context
 
-	MasterHost string
-	KubeCli    kubernetes.Interface
+	KubeCli kubernetes.Interface
 }
 
 type Cluster struct {
@@ -68,11 +66,11 @@ type Cluster struct {
 
 	config Config
 
-	cluster *spec.EtcdCluster
+	cluster *spec.Cluster
 
 	// in memory state of the cluster
 	// status is the source of truth after Cluster struct is materialized.
-	status        *spec.ClusterStatus
+	status        spec.ClusterStatus
 	memberCounter int
 
 	eventCh chan *clusterEvent
@@ -89,33 +87,28 @@ type Cluster struct {
 	gc *garbagecollection.GC
 }
 
-func New(config Config, e *spec.EtcdCluster, stopC <-chan struct{}, wg *sync.WaitGroup) *Cluster {
-	lg := logrus.WithField("pkg", "cluster").WithField("cluster-name", e.Name)
+func New(config Config, cl *spec.Cluster, stopC <-chan struct{}, wg *sync.WaitGroup) *Cluster {
+	lg := logrus.WithField("pkg", "cluster").WithField("cluster-name", cl.Metadata.Name)
 	c := &Cluster{
 		logger:  lg,
 		config:  config,
-		cluster: e,
+		cluster: cl,
 		eventCh: make(chan *clusterEvent, 100),
 		stopCh:  make(chan struct{}),
-		status:  &e.Status,
-		gc:      garbagecollection.New(config.KubeCli, e.Namespace),
-	}
-
-	if c.status == nil {
-		c.status = &spec.ClusterStatus{}
+		status:  cl.Status.Copy(),
+		gc:      garbagecollection.New(config.KubeCli, cl.Metadata.Namespace),
 	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 
-		err := c.setup()
-		if err != nil {
+		if err := c.setup(); err != nil {
 			c.logger.Errorf("cluster failed to setup: %v", err)
 			if c.status.Phase != spec.ClusterPhaseFailed {
 				c.status.SetReason(err.Error())
 				c.status.SetPhase(spec.ClusterPhaseFailed)
-				if err := c.updateStatus(); err != nil {
+				if err := c.updateTPRStatus(); err != nil {
 					c.logger.Errorf("failed to update cluster phase (%v): %v", spec.ClusterPhaseFailed, err)
 				}
 			}
@@ -138,7 +131,7 @@ func (c *Cluster) setup() error {
 	case spec.ClusterPhaseNone:
 		shouldCreateCluster = true
 	case spec.ClusterPhaseCreating:
-		return errors.New("cluster failed to be created")
+		return errCreatedCluster
 	case spec.ClusterPhaseRunning:
 		shouldCreateCluster = false
 
@@ -160,15 +153,14 @@ func (c *Cluster) setup() error {
 }
 
 func (c *Cluster) create() error {
-	c.logger.Infof("creating cluster with Spec (%#v), Status (%#v)", c.cluster.Spec, c.cluster.Status)
 	c.status.SetPhase(spec.ClusterPhaseCreating)
-	if err := c.updateStatus(); err != nil {
+
+	if err := c.updateTPRStatus(); err != nil {
 		return fmt.Errorf("cluster create: failed to update cluster phase (%v): %v", spec.ClusterPhaseCreating, err)
 	}
+	c.logger.Infof("creating cluster with Spec (%#v), Status (%#v)", c.cluster.Spec, c.cluster.Status)
 
-	if err := c.gc.CollectCluster(c.cluster.Name, c.cluster.UID); err != nil {
-		return fmt.Errorf("cluster create: failed to clean up conflict resources: %v", err)
-	}
+	c.gc.CollectCluster(c.cluster.Metadata.Name, c.cluster.Metadata.UID)
 
 	if c.bm != nil {
 		if err := c.bm.setup(); err != nil {
@@ -201,7 +193,7 @@ func (c *Cluster) prepareSeedMember() error {
 			err = c.migrateBootMember()
 		}
 	} else {
-		err = c.newSeedMember()
+		err = c.bootstrap()
 	}
 	if err != nil {
 		return err
@@ -241,9 +233,10 @@ func (c *Cluster) run(stopC <-chan struct{}) {
 	}()
 
 	c.status.SetPhase(spec.ClusterPhaseRunning)
-	if err := c.updateStatus(); err != nil {
+	if err := c.updateTPRStatus(); err != nil {
 		c.logger.Warningf("failed to update TPR status: %v", err)
 	}
+	c.logger.Infof("start running...")
 
 	var rerr error
 	for {
@@ -308,7 +301,11 @@ func (c *Cluster) run(stopC <-chan struct{}) {
 				break
 			}
 
-			if err := c.updateStatus(); err != nil {
+			if err := c.updateLocalBackupStatus(); err != nil {
+				c.logger.Warningf("failed to update local backup service status: %v", err)
+			}
+
+			if err := c.updateTPRStatus(); err != nil {
 				c.logger.Warningf("failed to update TPR status: %v", err)
 			}
 		}
@@ -330,22 +327,8 @@ func isSpecEqual(s1, s2 spec.ClusterSpec) bool {
 	return true
 }
 
-func isFatalError(err error) bool {
-	switch err {
-	case errNoBackupExist, errInvalidMemberName, errUnexpectedUnreadyMember:
-		return true
-	default:
-		return false
-	}
-}
-
-func (c *Cluster) makeSeedMember() *etcdutil.Member {
-	etcdName := etcdutil.CreateMemberName(c.cluster.Name, c.memberCounter)
-	return &etcdutil.Member{Name: etcdName}
-}
-
 func (c *Cluster) startSeedMember(recoverFromBackup bool) error {
-	m := c.makeSeedMember()
+	m := &etcdutil.Member{Name: etcdutil.CreateMemberName(c.cluster.Metadata.Name, c.memberCounter)}
 	ms := etcdutil.NewMemberSet(m)
 	if err := c.createPodAndService(ms, m, "new", recoverFromBackup); err != nil {
 		return fmt.Errorf("failed to create seed member (%s): %v", m.Name, err)
@@ -356,35 +339,37 @@ func (c *Cluster) startSeedMember(recoverFromBackup bool) error {
 	return nil
 }
 
-func (c *Cluster) newSeedMember() error {
+// bootstrap creates the seed etcd member for a new cluster.
+func (c *Cluster) bootstrap() error {
 	return c.startSeedMember(false)
 }
 
-func (c *Cluster) restoreSeedMember() error {
+// recover recovers the cluster by creating a seed etcd member from a backup.
+func (c *Cluster) recover() error {
 	return c.startSeedMember(true)
 }
 
-func (c *Cluster) Update(e *spec.EtcdCluster) {
+func (c *Cluster) Update(cl *spec.Cluster) {
 	c.send(&clusterEvent{
 		typ:     eventModifyCluster,
-		cluster: e,
+		cluster: cl,
 	})
 }
 
 func (c *Cluster) delete() {
-	if err := c.gc.CollectCluster(c.cluster.Name, garbagecollection.NullUID); err != nil {
-		c.logger.Errorf("cluster delete: fail to clean up resources %v", err)
+	c.gc.CollectCluster(c.cluster.Metadata.Name, garbagecollection.NullUID)
+
+	if c.bm == nil {
+		return
 	}
 
-	if c.bm != nil {
-		if err := c.bm.cleanup(); err != nil {
-			c.logger.Errorf("cluster deletion: backup manager failed to cleanup: %v", err)
-		}
+	if err := c.bm.cleanup(); err != nil {
+		c.logger.Errorf("cluster deletion: backup manager failed to cleanup: %v", err)
 	}
 }
 
 func (c *Cluster) createClientServiceLB() error {
-	if _, err := k8sutil.CreateEtcdService(c.config.KubeCli, c.cluster.Name, c.cluster.Namespace, c.cluster.AsOwner()); err != nil {
+	if _, err := k8sutil.CreateEtcdService(c.config.KubeCli, c.cluster.Metadata.Name, c.cluster.Metadata.Namespace, c.cluster.AsOwner()); err != nil {
 		if !k8sutil.IsKubernetesResourceAlreadyExistError(err) {
 			return err
 		}
@@ -393,7 +378,7 @@ func (c *Cluster) createClientServiceLB() error {
 }
 
 func (c *Cluster) deleteClientServiceLB() error {
-	err := c.config.KubeCli.Core().Services(c.cluster.Namespace).Delete(c.cluster.Name, nil)
+	err := c.config.KubeCli.Core().Services(c.cluster.Metadata.Namespace).Delete(c.cluster.Metadata.Name, nil)
 	if err != nil {
 		if !k8sutil.IsKubernetesResourceNotFoundError(err) {
 			return err
@@ -408,11 +393,11 @@ func (c *Cluster) createPodAndService(members etcdutil.MemberSet, m *etcdutil.Me
 		token = uuid.New()
 	}
 
-	pod := k8sutil.MakeEtcdPod(m, members.PeerURLPairs(), c.cluster.Name, state, token, c.cluster.Spec, c.cluster.AsOwner())
+	pod := k8sutil.NewEtcdPod(m, members.PeerURLPairs(), c.cluster.Metadata.Name, state, token, c.cluster.Spec, c.cluster.AsOwner())
 	if needRecovery {
-		k8sutil.AddRecoveryToPod(pod, c.cluster.Name, m.Name, token, c.cluster.Spec)
+		k8sutil.AddRecoveryToPod(pod, c.cluster.Metadata.Name, m.Name, token, c.cluster.Spec)
 	}
-	p, err := c.config.KubeCli.Core().Pods(c.cluster.Namespace).Create(pod)
+	p, err := c.config.KubeCli.Core().Pods(c.cluster.Metadata.Namespace).Create(pod)
 	if err != nil {
 		return err
 	}
@@ -422,14 +407,14 @@ func (c *Cluster) createPodAndService(members etcdutil.MemberSet, m *etcdutil.Me
 	// Before that, this member is "partitioned".
 	// Failure case 2: service belongs to previous pod and waits to be GC-ed. On such case, we are OK to return on this method.
 	// Once the service is GC-ed, it's the same as case 1, and we relies on liveness probe to delete the pod.
-	svc := k8sutil.NewMemberServiceManifest(m.Name, c.cluster.Name, metatypes.OwnerReference{
+	svc := k8sutil.NewMemberServiceManifest(m.Name, c.cluster.Metadata.Name, metatypes.OwnerReference{
 		// The Pod result from kubecli doesn't contain TypeMeta.
 		APIVersion: "v1",
 		Kind:       "Pod",
 		Name:       p.Name,
 		UID:        p.UID,
 	})
-	if _, err := k8sutil.CreateMemberService(c.config.KubeCli, c.cluster.Namespace, svc); err != nil {
+	if _, err := k8sutil.CreateMemberService(c.config.KubeCli, c.cluster.Metadata.Namespace, svc); err != nil {
 		if !k8sutil.IsKubernetesResourceAlreadyExistError(err) {
 			return err
 		}
@@ -438,17 +423,16 @@ func (c *Cluster) createPodAndService(members etcdutil.MemberSet, m *etcdutil.Me
 }
 
 func (c *Cluster) removePodAndService(name string) error {
-	err := c.config.KubeCli.Core().Services(c.cluster.Namespace).Delete(name, nil)
+	ns := c.cluster.Metadata.Namespace
+	err := c.config.KubeCli.Core().Services(ns).Delete(name, nil)
 	if err != nil {
 		if !k8sutil.IsKubernetesResourceNotFoundError(err) {
 			return err
 		}
 	}
 
-	err = c.config.KubeCli.Core().Pods(c.cluster.Namespace).Delete(
-		name,
-		api.NewDeleteOptions(podTerminationGracePeriod),
-	)
+	opts := v1.NewDeleteOptions(podTerminationGracePeriod)
+	err = c.config.KubeCli.Core().Pods(ns).Delete(name, opts)
 	if err != nil {
 		if !k8sutil.IsKubernetesResourceNotFoundError(err) {
 			return err
@@ -458,7 +442,7 @@ func (c *Cluster) removePodAndService(name string) error {
 }
 
 func (c *Cluster) pollPods() ([]*v1.Pod, []*v1.Pod, error) {
-	podList, err := c.config.KubeCli.Core().Pods(c.cluster.Namespace).List(k8sutil.ClusterListOpt(c.cluster.Name))
+	podList, err := c.config.KubeCli.Core().Pods(c.cluster.Metadata.Namespace).List(k8sutil.ClusterListOpt(c.cluster.Metadata.Name))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to list running pods: %v", err)
 	}
@@ -471,8 +455,9 @@ func (c *Cluster) pollPods() ([]*v1.Pod, []*v1.Pod, error) {
 			c.logger.Warningf("pollPods: ignore pod %v: no owner", pod.Name)
 			continue
 		}
-		if pod.OwnerReferences[0].UID != c.cluster.UID {
-			c.logger.Warningf("pollPods: ignore pod %v: owner (%v) is not %v", pod.Name, pod.OwnerReferences[0].UID, c.cluster.UID)
+		if pod.OwnerReferences[0].UID != c.cluster.Metadata.UID {
+			c.logger.Warningf("pollPods: ignore pod %v: owner (%v) is not %v",
+				pod.Name, pod.OwnerReferences[0].UID, c.cluster.Metadata.UID)
 			continue
 		}
 		switch pod.Status.Phase {
@@ -486,46 +471,67 @@ func (c *Cluster) pollPods() ([]*v1.Pod, []*v1.Pod, error) {
 	return running, pending, nil
 }
 
-func (c *Cluster) updateStatus() error {
-	if reflect.DeepEqual(c.cluster.Status, *c.status) {
+func (c *Cluster) updateTPRStatus() error {
+	if reflect.DeepEqual(c.cluster.Status, c.status) {
 		return nil
 	}
 
 	newCluster := c.cluster
-	newCluster.Status = *c.status
-	newCluster, err := k8sutil.UpdateClusterTPRObject(c.config.KubeCli.Core().GetRESTClient(), c.cluster.GetNamespace(), newCluster)
+	newCluster.Status = c.status
+	newCluster, err := k8sutil.UpdateClusterTPRObject(c.config.KubeCli.Core().RESTClient(), c.cluster.Metadata.Namespace, newCluster)
 	if err != nil {
 		return err
 	}
 
 	c.cluster = newCluster
+
+	return nil
+}
+
+func (c *Cluster) updateLocalBackupStatus() error {
+	if c.bm == nil {
+		return nil
+	}
+
+	bs, err := c.bm.getStatus()
+	if err != nil {
+		return err
+	}
+	c.status.BackupServiceStatus = backupServiceStatusToTPRBackupServiceStatu(bs)
+
 	return nil
 }
 
 func (c *Cluster) reportFailedStatus() {
+	retryInterval := 5 * time.Second
+
 	f := func() (bool, error) {
 		c.status.SetPhase(spec.ClusterPhaseFailed)
-		err := c.updateStatus()
+		err := c.updateTPRStatus()
 		if err == nil || k8sutil.IsKubernetesResourceNotFoundError(err) {
 			return true, nil
 		}
-		if apierrors.IsConflict(err) {
-			cl, err := k8sutil.GetClusterTPRObject(c.config.KubeCli.Core().GetRESTClient(), c.cluster.Namespace, c.cluster.Name)
-			if err != nil {
-				// Update (PUT) with UID set will return conflict even if object is deleted.
-				// Because it will check UID first and return something like: "Precondition failed: UID in precondition: 0xc42712c0f0, UID in object meta: ".
-				if k8sutil.IsKubernetesResourceNotFoundError(err) {
-					return true, nil
-				}
-				c.logger.Warningf("report status: fail to get latest version: %v", err)
-				return false, nil
-			}
-			c.cluster = cl
+
+		if !apierrors.IsConflict(err) {
+			c.logger.Warningf("retry report status in %v: fail to update: %v", retryInterval, err)
 			return false, nil
 		}
-		c.logger.Warningf("report status: fail to update: %v", err)
+
+		cl, err := k8sutil.GetClusterTPRObject(c.config.KubeCli.CoreV1().RESTClient(), c.cluster.Metadata.Namespace, c.cluster.Metadata.Name)
+		if err != nil {
+			// Update (PUT) will return conflict even if object is deleted since we have UID set in object.
+			// Because it will check UID first and return something like:
+			// "Precondition failed: UID in precondition: 0xc42712c0f0, UID in object meta: ".
+			if k8sutil.IsKubernetesResourceNotFoundError(err) {
+				return true, nil
+			}
+			c.logger.Warningf("retry report status in %v: fail to get latest version: %v", retryInterval, err)
+			return false, nil
+		}
+		c.cluster = cl
 		return false, nil
+
 	}
 
-	retryutil.Retry(5*time.Second, math.MaxInt64, f)
+	retryutil.Retry(retryInterval, math.MaxInt64, f)
 }

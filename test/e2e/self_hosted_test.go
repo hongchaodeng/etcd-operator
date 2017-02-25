@@ -37,9 +37,6 @@ func TestSelfHosted(t *testing.T) {
 }
 
 func testCreateSelfHostedCluster(t *testing.T) {
-	if os.Getenv(envParallelTest) == envParallelTestTrue {
-		t.Parallel()
-	}
 	f := framework.Global
 	c := newClusterSpec("test-etcd-", 3)
 	c = clusterWithSelfHosted(c, &spec.SelfHostedPolicy{})
@@ -54,15 +51,12 @@ func testCreateSelfHostedCluster(t *testing.T) {
 		}
 	}()
 
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 240*time.Second); err != nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 240*time.Second); err != nil {
 		t.Fatalf("failed to create 3 members self-hosted etcd cluster: %v", err)
 	}
 }
 
 func testCreateSelfHostedClusterWithBootMember(t *testing.T) {
-	if os.Getenv(envParallelTest) == envParallelTestTrue {
-		t.Parallel()
-	}
 	dir, err := ioutil.TempDir("", "embed-etcd")
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +112,7 @@ func testCreateSelfHostedClusterWithBootMember(t *testing.T) {
 		}
 	}()
 
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 120*time.Second); err != nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 120*time.Second); err != nil {
 		t.Fatalf("failed to create 3 members etcd cluster: %v", err)
 	}
 }
