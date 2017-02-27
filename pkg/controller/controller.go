@@ -27,13 +27,13 @@ import (
 	"github.com/coreos/etcd-operator/pkg/backup/s3/s3config"
 	"github.com/coreos/etcd-operator/pkg/cluster"
 	"github.com/coreos/etcd-operator/pkg/spec"
-	"github.com/coreos/etcd-operator/pkg/util/constants"
 	"github.com/coreos/etcd-operator/pkg/util/k8sutil"
 
 	"github.com/Sirupsen/logrus"
-	"k8s.io/client-go/1.5/kubernetes"
-	"k8s.io/client-go/1.5/pkg/api/v1"
-	v1beta1extensions "k8s.io/client-go/1.5/pkg/apis/extensions/v1beta1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/pkg/api/v1"
+	v1beta1extensions "k8s.io/client-go/pkg/apis/extensions/v1beta1"
+	kwatch "k8s.io/client-go/pkg/watch"
 )
 
 var (
@@ -45,11 +45,16 @@ var (
 	ErrVersionOutdated = errors.New("requested version is outdated in apiserver")
 
 	initRetryWaitTime = 30 * time.Second
+
+	// Workaround for watching TPR resource.
+	// client-go has encoding issue and we want something more predictable.
+	KubeHttpCli *http.Client
+	MasterHost  string
 )
 
 type Event struct {
-	Type   string
-	Object *spec.EtcdCluster
+	Type   kwatch.EventType
+	Object *spec.Cluster
 }
 
 type Controller struct {
@@ -66,9 +71,9 @@ type Controller struct {
 }
 
 type Config struct {
-	MasterHost    string
-	Namespace     string
-	PVProvisioner string
+	Namespace      string
+	ServiceAccount string
+	PVProvisioner  string
 	s3config.S3Context
 	KubeCli kubernetes.Interface
 }
@@ -134,39 +139,45 @@ func (c *Controller) Run() error {
 		c.waitCluster.Wait()
 	}()
 
-	eventCh, errCh := c.monitor(watchVersion)
+	eventCh, errCh := c.watch(watchVersion)
 
 	go func() {
+		pt := newPanicTimer(time.Minute, "unexpected long blocking (> 1 Minute) when handling cluster event")
+
 		for event := range eventCh {
+			pt.start()
+
 			clus := event.Object
 			clus.Spec.Cleanup()
 
 			switch event.Type {
-			case "ADDED":
+			case kwatch.Added:
 				stopC := make(chan struct{})
 				nc := cluster.New(c.makeClusterConfig(), clus, stopC, &c.waitCluster)
 
-				c.stopChMap[clus.Name] = stopC
-				c.clusters[clus.Name] = nc
-				c.clusterRVs[clus.Name] = clus.ResourceVersion
+				c.stopChMap[clus.Metadata.Name] = stopC
+				c.clusters[clus.Metadata.Name] = nc
+				c.clusterRVs[clus.Metadata.Name] = clus.Metadata.ResourceVersion
 
 				analytics.ClusterCreated()
 				clustersCreated.Inc()
 				clustersTotal.Inc()
 
-			case "MODIFIED":
-				c.clusters[clus.Name].Update(clus)
-				c.clusterRVs[clus.Name] = clus.ResourceVersion
+			case kwatch.Modified:
+				c.clusters[clus.Metadata.Name].Update(clus)
+				c.clusterRVs[clus.Metadata.Name] = clus.Metadata.ResourceVersion
 				clustersModified.Inc()
 
-			case "DELETED":
-				c.clusters[clus.Name].Delete()
-				delete(c.clusters, clus.Name)
-				delete(c.clusterRVs, clus.Name)
+			case kwatch.Deleted:
+				c.clusters[clus.Metadata.Name].Delete()
+				delete(c.clusters, clus.Metadata.Name)
+				delete(c.clusterRVs, clus.Metadata.Name)
 				analytics.ClusterDeleted()
 				clustersDeleted.Inc()
 				clustersTotal.Dec()
 			}
+
+			pt.stop()
 		}
 	}()
 	return <-errCh
@@ -174,7 +185,7 @@ func (c *Controller) Run() error {
 
 func (c *Controller) findAllClusters() (string, error) {
 	c.logger.Info("finding existing clusters...")
-	clusterList, err := k8sutil.GetClusterList(c.Config.KubeCli.Core().GetRESTClient(), c.Config.Namespace)
+	clusterList, err := k8sutil.GetClusterList(c.Config.KubeCli.CoreV1().RESTClient(), c.Config.Namespace)
 	if err != nil {
 		return "", err
 	}
@@ -183,7 +194,7 @@ func (c *Controller) findAllClusters() (string, error) {
 		clus := clusterList.Items[i]
 
 		if clus.Status.IsFailed() {
-			c.logger.Infof("ignore failed cluster %s", clus.Name)
+			c.logger.Infof("ignore failed cluster %s", clus.Metadata.Name)
 			continue
 		}
 
@@ -191,21 +202,21 @@ func (c *Controller) findAllClusters() (string, error) {
 
 		stopC := make(chan struct{})
 		nc := cluster.New(c.makeClusterConfig(), &clus, stopC, &c.waitCluster)
-		c.stopChMap[clus.Name] = stopC
-		c.clusters[clus.Name] = nc
-		c.clusterRVs[clus.Name] = clus.ResourceVersion
+		c.stopChMap[clus.Metadata.Name] = stopC
+		c.clusters[clus.Metadata.Name] = nc
+		c.clusterRVs[clus.Metadata.Name] = clus.Metadata.ResourceVersion
 	}
 
-	return clusterList.ResourceVersion, nil
+	return clusterList.Metadata.ResourceVersion, nil
 }
 
 func (c *Controller) makeClusterConfig() cluster.Config {
 	return cluster.Config{
-		PVProvisioner: c.PVProvisioner,
-		S3Context:     c.S3Context,
+		PVProvisioner:  c.PVProvisioner,
+		ServiceAccount: c.Config.ServiceAccount,
+		S3Context:      c.S3Context,
 
-		MasterHost: c.MasterHost,
-		KubeCli:    c.KubeCli,
+		KubeCli: c.KubeCli,
 	}
 }
 
@@ -235,22 +246,26 @@ func (c *Controller) initResource() (string, error) {
 func (c *Controller) createTPR() error {
 	tpr := &v1beta1extensions.ThirdPartyResource{
 		ObjectMeta: v1.ObjectMeta{
-			Name: constants.TPRName,
+			Name: spec.TPRName(),
 		},
 		Versions: []v1beta1extensions.APIVersion{
-			{Name: "v1"},
+			{Name: spec.TPRVersion},
 		},
-		Description: "Managed etcd clusters",
+		Description: spec.TPRDescription,
 	}
-	_, err := c.KubeCli.Extensions().ThirdPartyResources().Create(tpr)
+	_, err := c.KubeCli.ExtensionsV1beta1().ThirdPartyResources().Create(tpr)
 	if err != nil {
 		return err
 	}
 
-	return k8sutil.WaitEtcdTPRReady(c.KubeCli.Core().GetRESTClient(), 3*time.Second, 30*time.Second, c.Namespace)
+	return k8sutil.WaitEtcdTPRReady(c.KubeCli.CoreV1().RESTClient(), 3*time.Second, 30*time.Second, c.Namespace)
 }
 
-func (c *Controller) monitor(watchVersion string) (<-chan *Event, <-chan error) {
+// watch creates a go routine, and watches the cluster.etcd kind resources from
+// the given watch version. It emits events on the resources through the returned
+// event chan. Errors will be reported through the returned error chan. The go routine
+// exits on any error.
+func (c *Controller) watch(watchVersion string) (<-chan *Event, <-chan error) {
 	eventCh := make(chan *Event)
 	// On unexpected error case, controller should exit
 	errCh := make(chan error, 1)
@@ -258,19 +273,15 @@ func (c *Controller) monitor(watchVersion string) (<-chan *Event, <-chan error) 
 	go func() {
 		defer close(eventCh)
 
-		host := c.MasterHost
-		ns := c.Namespace
-		httpcli := c.KubeCli.Core().GetRESTClient().Client
-
 		for {
-			resp, err := k8sutil.WatchClusters(host, ns, httpcli, watchVersion)
+			resp, err := k8sutil.WatchClusters(MasterHost, c.Config.Namespace, KubeHttpCli, watchVersion)
 			if err != nil {
 				errCh <- err
 				return
 			}
-			if resp.StatusCode != 200 {
+			if resp.StatusCode != http.StatusOK {
 				resp.Body.Close()
-				errCh <- errors.New("Invalid status code: " + resp.Status)
+				errCh <- errors.New("invalid status code: " + resp.Status)
 				return
 			}
 
@@ -296,9 +307,9 @@ func (c *Controller) monitor(watchVersion string) (<-chan *Event, <-chan error) 
 					if st.Code == http.StatusGone {
 						// event history is outdated.
 						// if nothing has changed, we can go back to watch again.
-						clusterList, err := k8sutil.GetClusterList(c.Config.KubeCli.Core().GetRESTClient(), c.Config.Namespace)
+						clusterList, err := k8sutil.GetClusterList(c.Config.KubeCli.CoreV1().RESTClient(), c.Config.Namespace)
 						if err == nil && !c.isClustersCacheStale(clusterList.Items) {
-							watchVersion = clusterList.ResourceVersion
+							watchVersion = clusterList.Metadata.ResourceVersion
 							break
 						}
 
@@ -313,7 +324,7 @@ func (c *Controller) monitor(watchVersion string) (<-chan *Event, <-chan error) 
 
 				c.logger.Debugf("etcd cluster event: %v %v", ev.Type, ev.Object.Spec)
 
-				watchVersion = ev.Object.ResourceVersion
+				watchVersion = ev.Object.Metadata.ResourceVersion
 				eventCh <- ev
 			}
 
@@ -324,14 +335,14 @@ func (c *Controller) monitor(watchVersion string) (<-chan *Event, <-chan error) 
 	return eventCh, errCh
 }
 
-func (c *Controller) isClustersCacheStale(currentClusters []spec.EtcdCluster) bool {
+func (c *Controller) isClustersCacheStale(currentClusters []spec.Cluster) bool {
 	if len(c.clusterRVs) != len(currentClusters) {
 		return true
 	}
 
 	for _, cc := range currentClusters {
-		rv, ok := c.clusterRVs[cc.Name]
-		if !ok || rv != cc.ResourceVersion {
+		rv, ok := c.clusterRVs[cc.Metadata.Name]
+		if !ok || rv != cc.Metadata.ResourceVersion {
 			return true
 		}
 	}

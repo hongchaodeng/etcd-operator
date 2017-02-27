@@ -19,6 +19,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"runtime"
 	"time"
 
 	"github.com/coreos/etcd-operator/pkg/analytics"
@@ -32,23 +34,20 @@ import (
 	"github.com/coreos/etcd-operator/version"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/coreos/etcd-operator/pkg/util/retryutil"
 	"golang.org/x/time/rate"
-	"k8s.io/client-go/1.5/kubernetes"
-	"k8s.io/client-go/1.5/pkg/api"
-	"k8s.io/client-go/1.5/pkg/labels"
-	"k8s.io/client-go/1.5/rest"
-	"k8s.io/client-go/1.5/tools/record"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/pkg/labels"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 )
 
 var (
 	analyticsEnabled bool
 	pvProvisioner    string
-	masterHost       string
-	tlsInsecure      bool
-	certFile         string
-	keyFile          string
-	caFile           string
 	namespace        string
+	name             string
 	awsSecret        string
 	awsConfig        string
 	s3Bucket         string
@@ -69,11 +68,6 @@ func init() {
 	flag.BoolVar(&analyticsEnabled, "analytics", true, "Send analytical event (Cluster Created/Deleted etc.) to Google Analytics")
 
 	flag.StringVar(&pvProvisioner, "pv-provisioner", "kubernetes.io/gce-pd", "persistent volume provisioner type")
-	flag.StringVar(&masterHost, "master", "", "API Server addr, e.g. ' - NOT RECOMMENDED FOR PRODUCTION - http://127.0.0.1:8080'. Omit parameter to run in on-cluster mode and utilize the service account token.")
-	flag.StringVar(&certFile, "cert-file", "", " - NOT RECOMMENDED FOR PRODUCTION - Path to public TLS certificate file.")
-	flag.StringVar(&keyFile, "key-file", "", "- NOT RECOMMENDED FOR PRODUCTION - Path to private TLS certificate file.")
-	flag.StringVar(&caFile, "ca-file", "", "- NOT RECOMMENDED FOR PRODUCTION - Path to TLS CA file.")
-	flag.BoolVar(&tlsInsecure, "tls-insecure", false, "- NOT RECOMMENDED FOR PRODUCTION - Don't verify API server's CA certificate.")
 	flag.StringVar(&awsSecret, "backup-aws-secret", "", "The name of the kube secret object that stores the aws credential file.")
 	flag.StringVar(&awsConfig, "backup-aws-config", "", "The name of the kube configmap object that presents the aws config file.")
 	flag.StringVar(&s3Bucket, "backup-s3-bucket", "", "The name of the aws S3 bucket to store backups.")
@@ -83,17 +77,48 @@ func init() {
 	flag.DurationVar(&gcInterval, "gc-interval", 10*time.Minute, "GC interval")
 	flag.Parse()
 
-	namespace = os.Getenv("MY_POD_NAMESPACE")
-	if len(namespace) == 0 {
-		namespace = "default"
+	// Workaround for watching TPR resource.
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err)
 	}
+	controller.MasterHost = restCfg.Host
+	restcli, err := k8sutil.NewTPRClient()
+	if err != nil {
+		panic(err)
+	}
+	controller.KubeHttpCli = restcli.Client
 }
 
 func main() {
+	namespace = os.Getenv("MY_POD_NAMESPACE")
+	if len(namespace) == 0 {
+		logrus.Fatalf("must set env MY_POD_NAMESPACE")
+	}
+	name = os.Getenv("MY_POD_NAME")
+	if len(name) == 0 {
+		logrus.Fatalf("must set env MY_POD_NAME")
+	}
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c)
+	go func() {
+		logrus.Infof("received signal: %v", <-c)
+		os.Exit(1)
+	}()
+
 	if printVersion {
-		fmt.Println("etcd-operator", version.Version)
+		fmt.Println("etcd-operator Version:", version.Version)
+		fmt.Println("Git SHA:", version.GitSHA)
+		fmt.Println("Go Version:", runtime.Version())
+		fmt.Printf("Go OS/Arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		os.Exit(0)
 	}
+
+	logrus.Infof("etcd-operator Version: %v", version.Version)
+	logrus.Infof("Git SHA: %s", version.GitSHA)
+	logrus.Infof("Go Version: %s", runtime.Version())
+	logrus.Infof("Go OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH)
 
 	if analyticsEnabled {
 		analytics.Enable()
@@ -113,11 +138,7 @@ func main() {
 			Namespace: namespace,
 			Name:      "etcd-operator",
 		},
-		Client: k8sutil.MustCreateClient(masterHost, tlsInsecure, &rest.TLSClientConfig{
-			CertFile: certFile,
-			KeyFile:  keyFile,
-			CAFile:   caFile,
-		}),
+		Client: k8sutil.MustNewKubeClient(),
 		LockConfig: resourcelock.ResourceLockConfig{
 			Identity:      id,
 			EventRecorder: &record.FakeRecorder{},
@@ -161,16 +182,17 @@ func run(stop <-chan struct{}) {
 }
 
 func newControllerConfig() controller.Config {
-	tlsConfig := rest.TLSClientConfig{
-		CertFile: certFile,
-		KeyFile:  keyFile,
-		CAFile:   caFile,
+	kubecli := k8sutil.MustNewKubeClient()
+
+	serviceAccount, err := getMyPodServiceAccount(kubecli)
+	if err != nil {
+		logrus.Fatalf("fail to get my pod's service account: %v", err)
 	}
-	kubecli := k8sutil.MustCreateClient(masterHost, tlsInsecure, &tlsConfig)
+
 	cfg := controller.Config{
-		MasterHost:    masterHost,
-		Namespace:     namespace,
-		PVProvisioner: pvProvisioner,
+		Namespace:      namespace,
+		ServiceAccount: serviceAccount,
+		PVProvisioner:  pvProvisioner,
 		S3Context: s3config.S3Context{
 			AWSSecret: awsSecret,
 			AWSConfig: awsConfig,
@@ -178,15 +200,26 @@ func newControllerConfig() controller.Config {
 		},
 		KubeCli: kubecli,
 	}
-	if len(cfg.MasterHost) == 0 {
-		logrus.Info("use in cluster client from k8s library")
-		cfg.MasterHost = k8sutil.MustGetInClusterMasterHost()
-	}
+
 	return cfg
 }
 
-func periodicFullGC(k8s kubernetes.Interface, ns string, d time.Duration) {
-	gc := garbagecollection.New(k8s, ns)
+func getMyPodServiceAccount(kubecli kubernetes.Interface) (string, error) {
+	var sa string
+	err := retryutil.Retry(5*time.Second, 100, func() (bool, error) {
+		pod, err := kubecli.CoreV1().Pods(namespace).Get(name)
+		if err != nil {
+			logrus.Errorf("fail to get operator pod (%s): %v", name, err)
+			return false, nil
+		}
+		sa = pod.Spec.ServiceAccountName
+		return true, nil
+	})
+	return sa, err
+}
+
+func periodicFullGC(kubecli kubernetes.Interface, ns string, d time.Duration) {
+	gc := garbagecollection.New(kubecli, ns)
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	for {
@@ -198,8 +231,8 @@ func periodicFullGC(k8s kubernetes.Interface, ns string, d time.Duration) {
 	}
 }
 
-func startChaos(ctx context.Context, k8s kubernetes.Interface, ns string, chaosLevel int) {
-	m := chaos.NewMonkeys(k8s)
+func startChaos(ctx context.Context, kubecli kubernetes.Interface, ns string, chaosLevel int) {
+	m := chaos.NewMonkeys(kubecli)
 	ls := labels.SelectorFromSet(map[string]string{"app": "etcd"})
 
 	switch chaosLevel {
@@ -213,8 +246,10 @@ func startChaos(ctx context.Context, k8s kubernetes.Interface, ns string, chaosL
 			KillProbability: 0.5,
 			KillMax:         1,
 		}
-
-		go m.CrushPods(ctx, c)
+		go func() {
+			time.Sleep(60 * time.Second) // don't start until quorum up
+			m.CrushPods(ctx, c)
+		}()
 
 	case 2:
 		logrus.Info("chaos level = 2: randomly kill at most five etcd pods every 30 seconds at 50%")

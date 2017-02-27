@@ -1,21 +1,21 @@
-package client
+package experimentalclient
 
 import (
 	"context"
 	"net/http"
 
 	"github.com/coreos/etcd-operator/pkg/spec"
-	"github.com/coreos/etcd-operator/pkg/util/constants"
 
-	"k8s.io/client-go/1.5/pkg/api"
-	"k8s.io/client-go/1.5/pkg/api/unversioned"
-	"k8s.io/client-go/1.5/pkg/api/v1"
-	"k8s.io/client-go/1.5/pkg/runtime"
-	"k8s.io/client-go/1.5/pkg/runtime/serializer"
-	"k8s.io/client-go/1.5/rest"
+	"github.com/coreos/etcd-operator/pkg/util/k8sutil"
+	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/pkg/api/unversioned"
+	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/runtime"
+	"k8s.io/client-go/rest"
 )
 
-// Operator operators etcd clusters atop Kubernetes.
+// NOTE: This is experimental client. We will likely change it in the future
+// Operator operates etcd clusters atop Kubernetes.
 type Operator interface {
 	// Create creates an etcd cluster.
 	Create(ctx context.Context, name string, spec spec.ClusterSpec) error
@@ -27,16 +27,16 @@ type Operator interface {
 	Update(ctx context.Context, name string, spec spec.ClusterSpec) error
 
 	// Get gets the etcd cluster information.
-	Get(ctx context.Context, name string) (*spec.EtcdCluster, error)
+	Get(ctx context.Context, name string) (*spec.Cluster, error)
 
 	// List lists all etcd clusters.
-	List(ctx context.Context) (*spec.EtcdClusterList, error)
+	List(ctx context.Context) (*spec.ClusterList, error)
 }
 
 var (
 	groupversion = unversioned.GroupVersion{
-		Group:   "coreos.com",
-		Version: "v1",
+		Group:   spec.TPRGroup,
+		Version: spec.TPRVersion,
 	}
 )
 
@@ -45,8 +45,8 @@ func init() {
 		func(scheme *runtime.Scheme) error {
 			scheme.AddKnownTypes(
 				groupversion,
-				&spec.EtcdCluster{},
-				&spec.EtcdClusterList{},
+				&spec.Cluster{},
+				&spec.ClusterList{},
 				&v1.ListOptions{},
 				&v1.DeleteOptions{},
 			)
@@ -56,42 +56,35 @@ func init() {
 }
 
 type operator struct {
-	tprClient *rest.RESTClient
-	tprName   string
-	ns        string
+	tprClient     *rest.RESTClient
+	tprKindPlural string
+	ns            string
 }
 
 func NewOperator(namespace string) (Operator, error) {
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	configureClient(cfg)
-
-	tprclient, err := rest.RESTClientFor(cfg)
+	tprclient, err := k8sutil.NewTPRClient()
 	if err != nil {
 		return nil, err
 	}
 
 	return &operator{
-		tprClient: tprclient,
-		tprName:   constants.TPRName,
-		ns:        namespace,
+		tprClient:     tprclient,
+		tprKindPlural: spec.TPRKindPlural,
+		ns:            namespace,
 	}, nil
 
 }
 
 func (o *operator) Create(ctx context.Context, name string, cspec spec.ClusterSpec) error {
-	cluster := &spec.EtcdCluster{
-		ObjectMeta: v1.ObjectMeta{
+	cluster := &spec.Cluster{
+		Metadata: v1.ObjectMeta{
 			Name: name,
 		},
 		Spec: cspec,
 	}
 
 	err := o.tprClient.Post().
-		Resource(o.tprName).
+		Resource(o.tprKindPlural).
 		Namespace(o.ns).
 		Body(cluster).
 		Do().Error()
@@ -101,7 +94,7 @@ func (o *operator) Create(ctx context.Context, name string, cspec spec.ClusterSp
 
 func (o *operator) Delete(ctx context.Context, name string) error {
 	return o.tprClient.Delete().
-		Resource(o.tprName).
+		Resource(o.tprKindPlural).
 		Namespace(o.ns).Name(name).Do().Error()
 }
 
@@ -116,7 +109,7 @@ func (o *operator) Update(ctx context.Context, name string, spec spec.ClusterSpe
 		var statusCode int
 
 		err = o.tprClient.Put().
-			Resource(o.tprName).
+			Resource(o.tprKindPlural).
 			Namespace(o.ns).
 			Name(name).
 			Body(e).
@@ -130,11 +123,11 @@ func (o *operator) Update(ctx context.Context, name string, spec spec.ClusterSpe
 	}
 }
 
-func (o *operator) Get(ctx context.Context, name string) (*spec.EtcdCluster, error) {
-	cluster := &spec.EtcdCluster{}
+func (o *operator) Get(ctx context.Context, name string) (*spec.Cluster, error) {
+	cluster := &spec.Cluster{}
 
 	err := o.tprClient.Get().
-		Resource(o.tprName).
+		Resource(o.tprKindPlural).
 		Namespace(o.ns).
 		Name(name).
 		Do().Into(cluster)
@@ -146,12 +139,13 @@ func (o *operator) Get(ctx context.Context, name string) (*spec.EtcdCluster, err
 	return cluster, nil
 }
 
-func (o *operator) List(ctx context.Context) (*spec.EtcdClusterList, error) {
-	clusters := &spec.EtcdClusterList{}
+func (o *operator) List(ctx context.Context) (*spec.ClusterList, error) {
+	clusters := &spec.ClusterList{}
 
 	err := o.tprClient.Get().
-		Resource(o.tprName).
+		Resource(o.tprKindPlural).
 		Namespace(o.ns).
+		VersionedParams(&v1.ListOptions{}, api.ParameterCodec).
 		Do().Into(clusters)
 
 	if err != nil {
@@ -159,11 +153,4 @@ func (o *operator) List(ctx context.Context) (*spec.EtcdClusterList, error) {
 	}
 
 	return clusters, nil
-}
-
-func configureClient(config *rest.Config) {
-	config.GroupVersion = &groupversion
-	config.APIPath = "/apis"
-	config.ContentType = runtime.ContentTypeJSON
-	config.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: api.Codecs}
 }

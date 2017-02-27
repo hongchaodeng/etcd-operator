@@ -19,18 +19,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd-operator/pkg/util/k8sutil"
 	"github.com/coreos/etcd-operator/test/e2e/framework"
-
-	"k8s.io/client-go/1.5/pkg/api/v1"
 )
 
 func TestBasic(t *testing.T) {
 	t.Run("basic test", func(t *testing.T) {
 		t.Run("create cluster", testCreateCluster)
-		t.Run("pause control", testPauseControl)
 		t.Run("upgrade cluster", testEtcdUpgrade)
+		t.Run("pause control", testPauseControl)
 	})
+}
+
+func TestKillOperator(t *testing.T) {
+	testStopOperator(t, true)
 }
 
 func testCreateCluster(t *testing.T) {
@@ -49,7 +50,7 @@ func testCreateCluster(t *testing.T) {
 		}
 	}()
 
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 60*time.Second); err != nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 60*time.Second); err != nil {
 		t.Fatalf("failed to create 3 members etcd cluster: %v", err)
 	}
 }
@@ -60,6 +61,10 @@ func testPauseControl(t *testing.T) {
 	if os.Getenv(envParallelTest) == envParallelTestTrue {
 		t.Parallel()
 	}
+	testStopOperator(t, false)
+}
+
+func testStopOperator(t *testing.T, kill bool) {
 	f := framework.Global
 	testEtcd, err := createCluster(t, f, newClusterSpec("test-etcd-", 3))
 	if err != nil {
@@ -71,37 +76,51 @@ func testPauseControl(t *testing.T) {
 		}
 	}()
 
-	names, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 60*time.Second)
+	names, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 60*time.Second)
 	if err != nil {
 		t.Fatalf("failed to create 3 members etcd cluster: %v", err)
 	}
 
-	testEtcd.Spec.Paused = true
-	if testEtcd, err = updateEtcdCluster(f, testEtcd); err != nil {
-		t.Fatalf("failed to pause control: %v", err)
-	}
+	if !kill {
+		testEtcd.Spec.Paused = true
+		if testEtcd, err = updateEtcdCluster(f, testEtcd); err != nil {
+			t.Fatalf("failed to pause control: %v", err)
+		}
 
-	// TODO: this is used to wait for the TPR to be updated.
-	// TODO: make this wait for reliable
-	time.Sleep(5 * time.Second)
+		// TODO: this is used to wait for the TPR to be updated.
+		// TODO: make this wait for reliable
+		time.Sleep(5 * time.Second)
+	} else {
+		if err := f.DeleteEtcdOperator(); err != nil {
+			t.Fatalf("fail to delete etcd operator pod: %v", err)
+		}
+		// wait twice grace period
+		time.Sleep(2 * time.Second)
+	}
 
 	if err := killMembers(f, names[0]); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 2, 30*time.Second); err != nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 2, 30*time.Second); err != nil {
 		t.Fatalf("failed to wait for killed member to die: %v", err)
 	}
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 30*time.Second); err == nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 30*time.Second); err == nil {
 		t.Fatalf("cluster should not be recovered: control is paused")
 	}
 
-	testEtcd.Spec.Paused = false
-	if _, err = updateEtcdCluster(f, testEtcd); err != nil {
-		t.Fatalf("failed to resume control: %v", err)
+	if !kill {
+		testEtcd.Spec.Paused = false
+		if _, err = updateEtcdCluster(f, testEtcd); err != nil {
+			t.Fatalf("failed to resume control: %v", err)
+		}
+	} else {
+		if err := f.SetupEtcdOperator(); err != nil {
+			t.Fatalf("fail to restart etcd operator: %v", err)
+		}
 	}
 
-	if _, err := waitUntilSizeReached(t, f, testEtcd.Name, 3, 60*time.Second); err != nil {
+	if _, err := waitUntilSizeReached(t, f, testEtcd.Metadata.Name, 3, 60*time.Second); err != nil {
 		t.Fatalf("failed to resize to 3 members etcd cluster: %v", err)
 	}
 }
@@ -124,9 +143,7 @@ func testEtcdUpgrade(t *testing.T) {
 		}
 	}()
 
-	_, err = waitSizeReachedWithAccept(t, f, testEtcd.Name, 3, 60*time.Second, func(pod *v1.Pod) bool {
-		return k8sutil.GetEtcdVersion(pod) == "3.0.16"
-	})
+	err = waitSizeAndVersionReached(t, f, testEtcd.Metadata.Name, "3.0.16", 3, 60*time.Second)
 	if err != nil {
 		t.Fatalf("failed to create 3 members etcd cluster: %v", err)
 	}
@@ -137,9 +154,7 @@ func testEtcdUpgrade(t *testing.T) {
 		t.Fatalf("fail to update cluster version: %v", err)
 	}
 
-	_, err = waitSizeReachedWithAccept(t, f, testEtcd.Name, 3, 60*time.Second, func(pod *v1.Pod) bool {
-		return k8sutil.GetEtcdVersion(pod) == "3.1.0"
-	})
+	err = waitSizeAndVersionReached(t, f, testEtcd.Metadata.Name, "3.1.0", 3, 60*time.Second)
 	if err != nil {
 		t.Fatalf("failed to wait new version etcd cluster: %v", err)
 	}

@@ -18,9 +18,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"k8s.io/client-go/1.5/pkg/api"
-	"k8s.io/client-go/1.5/pkg/api/unversioned"
-	"k8s.io/client-go/1.5/pkg/api/v1"
+	"k8s.io/client-go/pkg/api"
+	"k8s.io/client-go/pkg/api/unversioned"
+	"k8s.io/client-go/pkg/api/v1"
 )
 
 func etcdContainer(commands, version string) v1.Container {
@@ -29,7 +29,7 @@ func etcdContainer(commands, version string) v1.Container {
 		// Without waiting some time, there is highly probable flakes in network setup.
 		Command: []string{"/bin/sh", "-c", fmt.Sprintf("sleep 5; %s", commands)},
 		Name:    "etcd",
-		Image:   MakeEtcdImage(version),
+		Image:   EtcdImageName(version),
 		Ports: []v1.ContainerPort{
 			{
 				Name:          "server",
@@ -52,6 +52,11 @@ func etcdContainer(commands, version string) v1.Container {
 
 func containerWithLivenessProbe(c v1.Container, lp *v1.Probe) v1.Container {
 	c.LivenessProbe = lp
+	return c
+}
+
+func containerWithRequirements(c v1.Container, r v1.ResourceRequirements) v1.Container {
+	c.Resources = r
 	return c
 }
 

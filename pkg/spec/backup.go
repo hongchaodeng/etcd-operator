@@ -14,7 +14,8 @@
 
 package spec
 
-// TODO: supports object store like s3
+import "time"
+
 type BackupStorageType string
 
 const (
@@ -59,4 +60,30 @@ type PVSource struct {
 }
 
 type S3Source struct {
+}
+
+type BackupServiceStatus struct {
+	// RecentBackup is status of the most recent backup created by
+	// the backup service
+	RecentBackup *BackupStatus `json:"recentBackup,omitempty"`
+
+	// Backups is the totoal number of existing backups
+	Backups int `json:"backups"`
+
+	// BackupSize is the total size of existing backups in MB.
+	BackupSize float64 `json:"backupSize"`
+}
+
+type BackupStatus struct {
+	// Creation time of the backup.
+	CreationTime time.Time `json:"creationTime"`
+
+	// Size is the size of the backup in MB.
+	Size float64 `json:"size"`
+
+	// Version is the version of the backup cluster.
+	Version string `json:"version"`
+
+	// TimeTookInSecond is the total time took to create the backup.
+	TimeTookInSecond int `json:"timeTookInSecond"`
 }
