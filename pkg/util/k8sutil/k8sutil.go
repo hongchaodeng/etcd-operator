@@ -17,25 +17,27 @@ package k8sutil
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
+	"github.com/coreos/etcd-operator/pkg/backup/backupapi"
 	"github.com/coreos/etcd-operator/pkg/spec"
-	"github.com/coreos/etcd-operator/pkg/util"
 	"github.com/coreos/etcd-operator/pkg/util/constants"
 	"github.com/coreos/etcd-operator/pkg/util/etcdutil"
 	"github.com/coreos/etcd-operator/pkg/util/retryutil"
 
-	"k8s.io/client-go/1.5/kubernetes"
-	"k8s.io/client-go/1.5/pkg/api"
-	apierrors "k8s.io/client-go/1.5/pkg/api/errors"
-	"k8s.io/client-go/1.5/pkg/api/meta"
-	"k8s.io/client-go/1.5/pkg/api/meta/metatypes"
-	"k8s.io/client-go/1.5/pkg/api/v1"
-	"k8s.io/client-go/1.5/pkg/labels"
-	"k8s.io/client-go/1.5/pkg/util/intstr"
-	"k8s.io/client-go/1.5/rest"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/pkg/api"
+	apierrors "k8s.io/client-go/pkg/api/errors"
+	"k8s.io/client-go/pkg/api/meta"
+	"k8s.io/client-go/pkg/api/meta/metatypes"
+	"k8s.io/client-go/pkg/api/unversioned"
+	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/labels"
+	"k8s.io/client-go/pkg/runtime"
+	"k8s.io/client-go/pkg/runtime/serializer"
+	"k8s.io/client-go/pkg/util/intstr"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -71,7 +73,7 @@ func makeRestoreInitContainerSpec(backupAddr, name, token, version string) strin
 			Image: "tutum/curl",
 			Command: []string{
 				"/bin/sh", "-c",
-				fmt.Sprintf("curl -o %s %s", backupFile, util.MakeBackupURL(backupAddr, version)),
+				fmt.Sprintf("curl -o %s %s", backupFile, backupapi.NewBackupURL("http", backupAddr, version)),
 			},
 			VolumeMounts: []v1.VolumeMount{
 				{Name: "etcd-data", MountPath: etcdDir},
@@ -79,7 +81,7 @@ func makeRestoreInitContainerSpec(backupAddr, name, token, version string) strin
 		},
 		{
 			Name:  "restore-datadir",
-			Image: MakeEtcdImage(version),
+			Image: EtcdImageName(version),
 			Command: []string{
 				"/bin/sh", "-c",
 				fmt.Sprintf("ETCDCTL_API=3 etcdctl snapshot restore %[1]s"+
@@ -101,7 +103,7 @@ func makeRestoreInitContainerSpec(backupAddr, name, token, version string) strin
 	return string(b)
 }
 
-func MakeEtcdImage(version string) string {
+func EtcdImageName(version string) string {
 	return fmt.Sprintf("quay.io/coreos/etcd:v%v", version)
 }
 
@@ -109,21 +111,21 @@ func GetNodePortString(srv *v1.Service) string {
 	return fmt.Sprint(srv.Spec.Ports[0].NodePort)
 }
 
-func MakeBackupHostPort(clusterName string) string {
-	return fmt.Sprintf("%s:%d", MakeBackupName(clusterName), constants.DefaultBackupPodHTTPPort)
-}
-
 func PodWithNodeSelector(p *v1.Pod, ns map[string]string) *v1.Pod {
 	p.Spec.NodeSelector = ns
 	return p
 }
 
-func MakeBackupName(clusterName string) string {
+func BackupServiceAddr(clusterName string) string {
+	return fmt.Sprintf("%s:%d", BackupServiceName(clusterName), constants.DefaultBackupPodHTTPPort)
+}
+
+func BackupServiceName(clusterName string) string {
 	return fmt.Sprintf("%s-backup-sidecar", clusterName)
 }
 
 func CreateMemberService(kubecli kubernetes.Interface, ns string, svc *v1.Service) (*v1.Service, error) {
-	retSvc, err := kubecli.Core().Services(ns).Create(svc)
+	retSvc, err := kubecli.CoreV1().Services(ns).Create(svc)
 	if err != nil {
 		return nil, err
 	}
@@ -131,9 +133,9 @@ func CreateMemberService(kubecli kubernetes.Interface, ns string, svc *v1.Servic
 }
 
 func CreateEtcdService(kubecli kubernetes.Interface, clusterName, ns string, owner metatypes.OwnerReference) (*v1.Service, error) {
-	svc := makeEtcdService(clusterName)
+	svc := newEtcdServiceManifest(clusterName)
 	addOwnerRefToObject(svc.GetObjectMeta(), owner)
-	retSvc, err := kubecli.Core().Services(ns).Create(svc)
+	retSvc, err := kubecli.CoreV1().Services(ns).Create(svc)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +145,7 @@ func CreateEtcdService(kubecli kubernetes.Interface, clusterName, ns string, own
 // CreateAndWaitPod is a workaround for self hosted and util for testing.
 // We should eventually get rid of this in critical code path and move it to test util.
 func CreateAndWaitPod(kubecli kubernetes.Interface, ns string, pod *v1.Pod, timeout time.Duration) (*v1.Pod, error) {
-	_, err := kubecli.Core().Pods(ns).Create(pod)
+	_, err := kubecli.CoreV1().Pods(ns).Create(pod)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +153,7 @@ func CreateAndWaitPod(kubecli kubernetes.Interface, ns string, pod *v1.Pod, time
 	interval := 3 * time.Second
 	var retPod *v1.Pod
 	retryutil.Retry(interval, int(timeout/(interval)), func() (bool, error) {
-		retPod, err = kubecli.Core().Pods(ns).Get(pod.Name)
+		retPod, err = kubecli.CoreV1().Pods(ns).Get(pod.Name)
 		if err != nil {
 			return false, err
 		}
@@ -168,7 +170,7 @@ func CreateAndWaitPod(kubecli kubernetes.Interface, ns string, pod *v1.Pod, time
 	return retPod, nil
 }
 
-func makeEtcdService(clusterName string) *v1.Service {
+func newEtcdServiceManifest(clusterName string) *v1.Service {
 	labels := map[string]string{
 		"app":          "etcd",
 		"etcd_cluster": clusterName,
@@ -234,14 +236,14 @@ func NewMemberServiceManifest(etcdName, clusterName string, owner metatypes.Owne
 
 func AddRecoveryToPod(pod *v1.Pod, clusterName, name, token string, cs spec.ClusterSpec) {
 	pod.Annotations[v1.PodInitContainersBetaAnnotationKey] =
-		makeRestoreInitContainerSpec(MakeBackupHostPort(clusterName), name, token, cs.Version)
+		makeRestoreInitContainerSpec(BackupServiceAddr(clusterName), name, token, cs.Version)
 }
 
 func addOwnerRefToObject(o meta.Object, r metatypes.OwnerReference) {
 	o.SetOwnerReferences(append(o.GetOwnerReferences(), r))
 }
 
-func MakeEtcdPod(m *etcdutil.Member, initialCluster []string, clusterName, state, token string, cs spec.ClusterSpec, owner metatypes.OwnerReference) *v1.Pod {
+func NewEtcdPod(m *etcdutil.Member, initialCluster []string, clusterName, state, token string, cs spec.ClusterSpec, owner metatypes.OwnerReference) *v1.Pod {
 	commands := fmt.Sprintf("/usr/local/bin/etcd --data-dir=%s --name=%s --initial-advertise-peer-urls=%s "+
 		"--listen-peer-urls=http://0.0.0.0:2380 --listen-client-urls=http://0.0.0.0:2379 --advertise-client-urls=%s "+
 		"--initial-cluster=%s --initial-cluster-state=%s",
@@ -250,6 +252,9 @@ func MakeEtcdPod(m *etcdutil.Member, initialCluster []string, clusterName, state
 		commands = fmt.Sprintf("%s --initial-cluster-token=%s", commands, token)
 	}
 	container := containerWithLivenessProbe(etcdContainer(commands, cs.Version), etcdLivenessProbe())
+	if cs.Pod != nil {
+		container = containerWithRequirements(container, cs.Pod.ResourceRequirements)
+	}
 	pod := &v1.Pod{
 		ObjectMeta: v1.ObjectMeta{
 			Name: m.Name,
@@ -284,45 +289,33 @@ func MakeEtcdPod(m *etcdutil.Member, initialCluster []string, clusterName, state
 	return pod
 }
 
-func MustGetInClusterMasterHost() string {
+func MustNewKubeClient() kubernetes.Interface {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		panic(err)
 	}
-	return cfg.Host
+	return kubernetes.NewForConfigOrDie(cfg)
 }
 
-// tlsConfig isn't modified inside this function.
-// The reason it's a pointer is that it's not necessary to have tlsconfig to create a client.
-func MustCreateClient(host string, tlsInsecure bool, tlsConfig *rest.TLSClientConfig) kubernetes.Interface {
-	var cfg *rest.Config
-	if len(host) == 0 {
-		var err error
-		cfg, err = rest.InClusterConfig()
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		cfg = &rest.Config{
-			Host:  host,
-			QPS:   100,
-			Burst: 100,
-		}
-		hostUrl, err := url.Parse(host)
-		if err != nil {
-			panic(fmt.Sprintf("failed to parse host url %s : %v", host, err))
-		}
-		if hostUrl.Scheme == "https" {
-			cfg.TLSClientConfig = *tlsConfig
-			cfg.Insecure = tlsInsecure
-		}
+func NewTPRClient() (*rest.RESTClient, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
 	}
 
-	c, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		panic(err)
+	config.GroupVersion = &unversioned.GroupVersion{
+		Group:   spec.TPRGroup,
+		Version: spec.TPRVersion,
 	}
-	return c
+	config.APIPath = "/apis"
+	config.ContentType = runtime.ContentTypeJSON
+	config.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: api.Codecs}
+
+	restcli, err := rest.RESTClientFor(config)
+	if err != nil {
+		return nil, err
+	}
+	return restcli, nil
 }
 
 func IsKubernetesResourceAlreadyExistError(err error) bool {
@@ -334,9 +327,9 @@ func IsKubernetesResourceNotFoundError(err error) bool {
 }
 
 // We are using internal api types for cluster related.
-func ClusterListOpt(clusterName string) api.ListOptions {
-	return api.ListOptions{
-		LabelSelector: labels.SelectorFromSet(newLablesForCluster(clusterName)),
+func ClusterListOpt(clusterName string) v1.ListOptions {
+	return v1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(newLablesForCluster(clusterName)).String(),
 	}
 }
 

@@ -17,7 +17,17 @@ package backup
 import "io"
 
 type backend interface {
-	save(version string, snapRev int64, rc io.Reader) error
+	// save saves the backup from the given reader with given etcd version and revision.
+	// It returns the size of the snapshot saved.
+	save(etcdVersion string, rev int64, r io.Reader) (size int64, err error)
+
 	getLatest() (name string, rc io.ReadCloser, err error)
+
+	// total returns the total number of available backups.
+	total() (int, error)
+
+	// total returns the total size of the backups.
+	totalSize() (int64, error)
+
 	purge(maxBackupFiles int) error
 }

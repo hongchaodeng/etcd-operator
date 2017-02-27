@@ -18,10 +18,10 @@ import (
 	"github.com/coreos/etcd-operator/pkg/util/k8sutil"
 
 	"github.com/Sirupsen/logrus"
-	"k8s.io/client-go/1.5/kubernetes"
-	"k8s.io/client-go/1.5/pkg/api"
-	"k8s.io/client-go/1.5/pkg/labels"
-	"k8s.io/client-go/1.5/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/labels"
+	"k8s.io/client-go/pkg/types"
 )
 
 const (
@@ -33,62 +33,61 @@ var pkgLogger = logrus.WithField("pkg", "gc")
 type GC struct {
 	logger *logrus.Entry
 
-	k8s kubernetes.Interface
-	ns  string
+	kubecli kubernetes.Interface
+	ns      string
 }
 
-func New(k8s kubernetes.Interface, ns string) *GC {
+func New(kubecli kubernetes.Interface, ns string) *GC {
 	return &GC{
-		logger: pkgLogger,
-		k8s:    k8s,
-		ns:     ns,
+		logger:  pkgLogger,
+		kubecli: kubecli,
+		ns:      ns,
 	}
 }
 
 // CollectCluster collects resources that matches cluster lable, but
 // does not belong to the cluster with given clusterUID
-func (gc *GC) CollectCluster(cluster string, clusterUID types.UID) error {
-	return gc.collectResources(k8sutil.ClusterListOpt(cluster), map[types.UID]bool{clusterUID: true})
+func (gc *GC) CollectCluster(cluster string, clusterUID types.UID) {
+	gc.collectResources(k8sutil.ClusterListOpt(cluster), map[types.UID]bool{clusterUID: true})
 }
 
 // FullyCollect collects resources that were created before,
 // but does not belong to any current running clusters.
 func (gc *GC) FullyCollect() error {
-	clusters, err := k8sutil.GetClusterList(gc.k8s.Core().GetRESTClient(), gc.ns)
+	clusters, err := k8sutil.GetClusterList(gc.kubecli.CoreV1().RESTClient(), gc.ns)
 	if err != nil {
 		return err
 	}
 
 	clusterUIDSet := make(map[types.UID]bool)
 	for _, c := range clusters.Items {
-		clusterUIDSet[c.GetUID()] = true
+		clusterUIDSet[c.Metadata.UID] = true
 	}
 
-	option := api.ListOptions{
+	option := v1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(map[string]string{
 			"app": "etcd",
-		}),
+		}).String(),
 	}
 
-	return gc.collectResources(option, clusterUIDSet)
-}
-
-func (gc *GC) collectResources(option api.ListOptions, runningSet map[types.UID]bool) error {
-	if err := gc.collectPods(option, runningSet); err != nil {
-		return err
-	}
-	if err := gc.collectServices(option, runningSet); err != nil {
-		return err
-	}
-	if err := gc.collectReplicaSet(option, runningSet); err != nil {
-		return err
-	}
-
+	gc.collectResources(option, clusterUIDSet)
 	return nil
 }
 
-func (gc *GC) collectPods(option api.ListOptions, runningSet map[types.UID]bool) error {
-	pods, err := gc.k8s.Core().Pods(gc.ns).List(option)
+func (gc *GC) collectResources(option v1.ListOptions, runningSet map[types.UID]bool) {
+	if err := gc.collectPods(option, runningSet); err != nil {
+		gc.logger.Errorf("gc pods failed: %v", err)
+	}
+	if err := gc.collectServices(option, runningSet); err != nil {
+		gc.logger.Errorf("gc services failed: %v", err)
+	}
+	if err := gc.collectReplicaSet(option, runningSet); err != nil {
+		gc.logger.Errorf("gc replica set failed: %v", err)
+	}
+}
+
+func (gc *GC) collectPods(option v1.ListOptions, runningSet map[types.UID]bool) error {
+	pods, err := gc.kubecli.CoreV1().Pods(gc.ns).List(option)
 	if err != nil {
 		return err
 	}
@@ -98,10 +97,11 @@ func (gc *GC) collectPods(option api.ListOptions, runningSet map[types.UID]bool)
 			gc.logger.Warningf("failed to check pod %s: no owner", p.GetName())
 			continue
 		}
-		if !runningSet[p.OwnerReferences[0].UID] {
+		// Pods failed due to liveness probe are also collected
+		if !runningSet[p.OwnerReferences[0].UID] || p.Status.Phase == v1.PodFailed {
 			// kill bad pods without grace period to kill it immediately
-			err = gc.k8s.Core().Pods(gc.ns).Delete(p.GetName(), api.NewDeleteOptions(0))
-			if err != nil {
+			err = gc.kubecli.CoreV1().Pods(gc.ns).Delete(p.GetName(), v1.NewDeleteOptions(0))
+			if err != nil && !k8sutil.IsKubernetesResourceNotFoundError(err) {
 				return err
 			}
 			gc.logger.Infof("deleted pod (%v)", p.GetName())
@@ -110,8 +110,8 @@ func (gc *GC) collectPods(option api.ListOptions, runningSet map[types.UID]bool)
 	return nil
 }
 
-func (gc *GC) collectServices(option api.ListOptions, runningSet map[types.UID]bool) error {
-	srvs, err := gc.k8s.Core().Services(gc.ns).List(option)
+func (gc *GC) collectServices(option v1.ListOptions, runningSet map[types.UID]bool) error {
+	srvs, err := gc.kubecli.CoreV1().Services(gc.ns).List(option)
 	if err != nil {
 		return err
 	}
@@ -122,8 +122,8 @@ func (gc *GC) collectServices(option api.ListOptions, runningSet map[types.UID]b
 			continue
 		}
 		if !runningSet[srv.OwnerReferences[0].UID] {
-			err = gc.k8s.Core().Services(gc.ns).Delete(srv.GetName(), nil)
-			if err != nil {
+			err = gc.kubecli.CoreV1().Services(gc.ns).Delete(srv.GetName(), nil)
+			if err != nil && !k8sutil.IsKubernetesResourceNotFoundError(err) {
 				return err
 			}
 			gc.logger.Infof("deleted service (%v)", srv.GetName())
@@ -133,8 +133,8 @@ func (gc *GC) collectServices(option api.ListOptions, runningSet map[types.UID]b
 	return nil
 }
 
-func (gc *GC) collectReplicaSet(option api.ListOptions, runningSet map[types.UID]bool) error {
-	rss, err := gc.k8s.Extensions().ReplicaSets(gc.ns).List(option)
+func (gc *GC) collectReplicaSet(option v1.ListOptions, runningSet map[types.UID]bool) error {
+	rss, err := gc.kubecli.ExtensionsV1beta1().ReplicaSets(gc.ns).List(option)
 	if err != nil {
 		return err
 	}
@@ -151,7 +151,7 @@ func (gc *GC) collectReplicaSet(option api.ListOptions, runningSet map[types.UID
 			orphanOption := false
 			// set gracePeriod to delete the replica set immediately
 			gracePeriod := int64(0)
-			err = gc.k8s.Extensions().ReplicaSets(gc.ns).Delete(rs.GetName(), &api.DeleteOptions{
+			err = gc.kubecli.ExtensionsV1beta1().ReplicaSets(gc.ns).Delete(rs.GetName(), &v1.DeleteOptions{
 				OrphanDependents:   &orphanOption,
 				GracePeriodSeconds: &gracePeriod,
 			})
