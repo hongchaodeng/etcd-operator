@@ -147,7 +147,7 @@ func (c *Cluster) addOneSelfHostedMember() error {
 
 	// wait for the new pod to start and add itself into the etcd cluster.
 	oldN := c.members.Size()
-	err = c.waitNewMember(oldN, 6, newMember.Name)
+	err = c.waitNewMember(oldN, 18, newMember.Name)
 	if err != nil {
 		c.logger.Warningf("new member (%s) is still not added. Doing more inspection...", newMember.Name)
 		c.inspectSelfHostedMember(newMember.Name, pod.Name, ns, oldN)

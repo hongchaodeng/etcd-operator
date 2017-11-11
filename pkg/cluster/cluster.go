@@ -359,7 +359,7 @@ func (c *Cluster) startSeedMember() error {
 }
 
 func (c *Cluster) isSecurePeer() bool {
-	return c.cluster.Spec.TLS.IsSecurePeer()
+	return c.cluster.Spec.TLS.IsSecurePeer() || c.cluster.Spec.SelfHosted != nil
 }
 
 func (c *Cluster) isSecureClient() bool {

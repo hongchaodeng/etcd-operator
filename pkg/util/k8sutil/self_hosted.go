@@ -43,6 +43,7 @@ func NewSelfHostedEtcdPod(m *etcdutil.Member, initialCluster, endpoints []string
 		"--listen-peer-urls=%s --listen-client-urls=%s --advertise-client-urls=%s "+
 		"--initial-cluster=%s --initial-cluster-state=%s",
 		hostDataDir, m.Name, m.PeerURL(), m.ListenPeerURL(), m.ListenClientURL(), m.ClientURL(), strings.Join(initialCluster, ","), state)
+
 	if m.SecurePeer {
 		commands += fmt.Sprintf(" --peer-client-cert-auth=true --peer-trusted-ca-file=%[1]s/peer-ca.crt --peer-cert-file=%[1]s/peer.crt --peer-key-file=%[1]s/peer.key", peerTLSDir)
 	}
@@ -101,7 +102,8 @@ done
 	volumes := []v1.Volume{{
 		Name: etcdVolumeName,
 		// TODO: configurable mount host path.
-		VolumeSource: v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: etcdVolumeMountDir}},
+		// VolumeSource: v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: etcdVolumeMountDir}},
+		VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}},
 	}, {
 		Name:         varLockVolumeName,
 		VolumeSource: v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: varLockDir}},
@@ -111,9 +113,14 @@ done
 			MountPath: peerTLSDir,
 			Name:      peerTLSVolume,
 		})
-		volumes = append(volumes, v1.Volume{Name: peerTLSVolume, VolumeSource: v1.VolumeSource{
-			Secret: &v1.SecretVolumeSource{SecretName: cs.TLS.Static.Member.PeerSecret},
-		}})
+		// volumes = append(volumes, v1.Volume{Name: peerTLSVolume, VolumeSource: v1.VolumeSource{
+		// 	Secret: &v1.SecretVolumeSource{SecretName: cs.TLS.Static.Member.PeerSecret},
+		// }})
+		volumes = append(volumes, v1.Volume{
+			Name: peerTLSVolume,
+			// VolumeSource: v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: "/var/etcd/peer-tls/"}},
+			VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}},
+		})
 	}
 	if m.SecureClient {
 		c.VolumeMounts = append(c.VolumeMounts, v1.VolumeMount{
@@ -143,11 +150,32 @@ done
 			// If we set it to Never, the pod won't restart. If etcd won't come up, nor does other k8s API components.
 			RestartPolicy: v1.RestartPolicyAlways,
 			Containers:    []v1.Container{c},
-			Volumes:       volumes,
-			HostNetwork:   true,
-			DNSPolicy:     v1.DNSClusterFirstWithHostNet,
-			Hostname:      m.Name,
-			Subdomain:     clusterName,
+			InitContainers: []v1.Container{{
+				// send CSR and persist cert into /var/etcd/...
+				// Also change etcd container to use that cert to start.
+				Name:            "etcdcsr",
+				Image:           "gcr.io/coreos-k8s-scale-testing/etcdcsr",
+				ImagePullPolicy: "Always",
+				Command:         []string{"/usr/local/bin/entry.sh"},
+				VolumeMounts: []v1.VolumeMount{
+					{Name: peerTLSVolume, MountPath: peerTLSDir},
+				},
+				Env: []v1.EnvVar{{
+					Name:  "POD_NAME",
+					Value: m.Name,
+				}, {
+					Name:      "POD_IP",
+					ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "status.podIP"}},
+				}, {
+					Name:  "ETCD_CLUSTER_NAME",
+					Value: clusterName,
+				}},
+			}},
+			Volumes:     volumes,
+			HostNetwork: true,
+			DNSPolicy:   v1.DNSClusterFirstWithHostNet,
+			Hostname:    m.Name,
+			Subdomain:   clusterName,
 		},
 	}
 
