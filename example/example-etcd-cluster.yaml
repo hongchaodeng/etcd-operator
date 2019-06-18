@@ -9,3 +9,4 @@ metadata:
 spec:
   size: 3
   version: "3.2.13"
+  repository: "registry.cn-hangzhou.aliyuncs.com/kubeapps/etcd"
